@@ -195,12 +195,4 @@ All protected endpoints accept the secret via query parameter or `x-ingest-secre
 
 ---
 
-## Sharing with your team
-
-The repository is public: https://github.com/gatesyp/ai-funding-daily
-
-Feel free to share the link with your cofounder.
-
----
-
 Built following the original "AI Funding Daily — Production System Plan".
