@@ -22,6 +22,36 @@ The system automatically scrapes [aifunding.me](https://aifunding.me), stores st
 
 ---
 
+## Architecture
+
+```mermaid
+flowchart TD
+    Cron[Vercel Cron<br/>0 14 * * *] --> Ingest[POST /api/ingest]
+    
+    Ingest --> Scraper[lib/scraper.ts]
+    Scraper -->|llms-full.txt + Homepage| AIFunding[aifunding.me]
+    Scraper -->|Optional| Enrich[Enrich company pages<br/>for description + investors]
+    
+    Scraper --> IngestLogic[lib/ingest.ts]
+    IngestLogic --> Dedupe{Deduplicate?}
+    Dedupe -->|New| DB[(Neon Postgres<br/>Drizzle)]
+    Dedupe -->|Duplicate| Skip[Skip]
+    
+    DB --> Post[lib/telegram.ts]
+    Post --> Telegram[Telegram Channel<br/>One message per round]
+    
+    IngestLogic --> Log[(ingestion_runs<br/>audit table)]
+    
+    Backfill[GET /api/backfill?limit=N] --> Post
+```
+
+**Key flows:**
+- **Daily run**: Cron → `/api/ingest` → scrape → dedupe → store → (if new) enrich → post to Telegram
+- **Backfill**: Manual trigger to post historical rounds with rich formatting
+- **Enrichment** happens on-demand when posting (visits company pages for description + lead investors)
+
+---
+
 ## Local Development Setup
 
 ### 1. Clone and install
@@ -34,39 +64,16 @@ npm install
 
 ### 2. Environment Variables
 
-Create a `.env.local` file with the following variables:
+Create a `.env.local` file:
 
 ```env
-# Neon Database (required)
 DATABASE_URL="postgresql://..."
-
-# Telegram (required for posting)
 TELEGRAM_BOT_TOKEN="123456:ABC-..."
 TELEGRAM_CHANNEL_ID="-1003920707625"
-
-# Security (protects the ingest endpoint)
-INGEST_SECRET="your-long-random-string-here"
+INGEST_SECRET="your-long-random-string"
 ```
 
-#### How to get each value:
-
-**DATABASE_URL**
-- Log into [Neon](https://neon.tech)
-- Copy the connection string for your project
-
-**TELEGRAM_BOT_TOKEN**
-1. Open Telegram and talk to [@BotFather](https://t.me/BotFather)
-2. Send `/newbot`
-3. Follow the prompts and copy the token
-
-**TELEGRAM_CHANNEL_ID**
-1. Create (or use) your target channel
-2. Add your bot as an **Administrator** with "Post Messages" permission
-3. Forward any message from the channel to [@userinfobot](https://t.me/userinfobot)
-4. It will reply with the correct ID (starts with `-100...`)
-
-**INGEST_SECRET**
-- Generate any long random string (used to protect the `/api/ingest` endpoint)
+See the detailed "How to get each value" section below.
 
 ### 3. Run locally
 
@@ -74,125 +81,166 @@ INGEST_SECRET="your-long-random-string-here"
 npm run dev
 ```
 
-The app will be available at http://localhost:3000
-
-### 4. Test the system locally
-
-Trigger a manual scrape + post:
+### 4. Useful local commands
 
 ```bash
-# Basic ingest (scrape + store + post new rounds)
-curl -X POST "http://localhost:3000/api/ingest?secret=YOUR_INGEST_SECRET"
-```
+# Normal daily job
+curl -X POST "http://localhost:3000/api/ingest?secret=YOUR_SECRET"
 
-Backfill recent historical data (useful when first setting up):
+# Backfill recent data (great for initial setup)
+curl "http://localhost:3000/api/backfill?limit=30&secret=YOUR_SECRET"
 
-```bash
-# Post the last 25 rounds as individual messages
-curl "http://localhost:3000/api/backfill?limit=25&secret=YOUR_INGEST_SECRET"
-```
-
-Test Telegram connection only:
-
-```bash
-curl "http://localhost:3000/api/test-telegram?secret=YOUR_INGEST_SECRET"
-```
-
-Health check:
-
-```bash
-curl http://localhost:3000/api/health
+# Test Telegram only
+curl "http://localhost:3000/api/test-telegram?secret=YOUR_SECRET"
 ```
 
 ---
 
-## Project Structure
+## Telegram Bot Setup
 
+1. Create a bot with [@BotFather](https://t.me/BotFather) → `/newbot`
+2. Create your channel and add the bot as **Administrator** with "Post Messages" rights
+3. Get the Channel ID by forwarding a message to [@userinfobot](https://t.me/userinfobot)
+4. Add the token and channel ID to your environment variables
+
+---
+
+## Adding New Data Sources
+
+The current system is designed around **aifunding.me** as the primary (and currently only) source.
+
+### Where to extend
+
+- **Primary scraper logic**: `lib/scraper.ts`
+- **Ingestion orchestration**: `lib/ingest.ts`
+- **Data models**: `db/schema.ts`
+
+### Recommended approach for a new source
+
+1. Create a new file under `lib/scrapers/` (e.g. `newsource.ts`)
+2. Implement a function that returns normalized data in the shape expected by `ingest.ts` (or adapt the ingest layer).
+3. Add a new API route or extend the existing `/api/ingest` to accept a `source` parameter.
+4. Update deduplication logic if the new source has different uniqueness rules.
+5. Add a new table or use the flexible `raw_data` JSONB column for source-specific fields.
+
+**Important principles**:
+- Keep the daily cron focused and reliable.
+- New sources should be pluggable without breaking the existing Telegram posting format.
+- Always enrich with description + investors when possible before posting.
+
+---
+
+## For AI Agents & Other LLMs
+
+If you are an AI agent (Claude, Cursor, Grok, etc.) that has been asked to work on this project, please read this section carefully.
+
+### Project Goals (for context)
+
+- Reliable daily delivery of individual AI funding announcements via Telegram
+- High signal, low noise (one message per real new round)
+- Clean, maintainable TypeScript codebase
+- Easy for humans and agents to extend
+
+### Quick Start for an Agent
+
+To set up this project from scratch:
+
+```bash
+git clone https://github.com/gatesyp/ai-funding-daily.git
+cd ai-funding-daily
+npm install
 ```
-app/
-├── api/
-│   ├── backfill/      # Force-post historical rounds (rich format)
-│   ├── health/
-│   ├── ingest/        # Main daily job (scrape + store + post)
-│   └── test-telegram/
-├── layout.tsx
-└── page.tsx
 
-lib/
-├── db.ts              # Neon + Drizzle client
-├── ingest.ts          # Core logic (scrape → dedupe → insert)
-├── scraper.ts         # aifunding.me parsing + company page enrichment
-└── telegram.ts        # Message formatting + sending via Grammy
+You will need four environment variables (see the Local Development Setup section above for exact instructions):
 
-db/
-└── schema.ts          # companies, funding_rounds, ingestion_runs
+- `DATABASE_URL` (Neon)
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHANNEL_ID`
+- `INGEST_SECRET`
 
-vercel.json            # Cron configuration (runs at 14:00 UTC)
+Create a `.env.local` file with these values.
+
+Then run:
+
+```bash
+npm run dev
 ```
+
+### Most Important Files for Agents
+
+| File                        | Why it matters                                      |
+|----------------------------|-----------------------------------------------------|
+| `lib/scraper.ts`           | All data acquisition logic + enrichment             |
+| `lib/ingest.ts`            | The core "brain" – deduplication and flow control   |
+| `lib/telegram.ts`          | Message formatting and delivery                     |
+| `app/api/ingest/route.ts`  | The main daily entrypoint                           |
+| `app/api/backfill/route.ts`| Historical / bulk posting (very useful for testing) |
+| `db/schema.ts`             | Database shape                                      |
+
+### Common Pitfalls (tell the agent about these)
+
+- Telegram rate limits when sending many messages quickly (use the built-in 800ms+ delay)
+- The bot must be an **admin** of the channel with posting rights
+- Some companies legitimately have no public investors listed
+- The first time you run the system it will ingest hundreds of "latest" rounds — use `/api/backfill` for controlled posting
+- Never commit real secrets (`.env.local` is gitignored)
+
+### Recommended Workflow for Agents
+
+1. Understand the current flow by reading `lib/ingest.ts` first.
+2. Make changes in small, testable increments.
+3. Use the `/api/backfill?limit=5` endpoint heavily while developing new features.
+4. Always test Telegram output format with `/api/test-telegram`.
+5. Update this README when adding significant new capabilities.
+
+### Questions an agent should ask the user
+
+- Do you want a new data source added, or improvements to the existing one?
+- Should new sources also post to the same Telegram channel?
+- Do you want richer data (full funding history, valuations over time, etc.)?
 
 ---
 
 ## Deployment (Vercel + GitHub)
 
-The project is already set up for Vercel.
+The project is connected to GitHub at:
+**https://github.com/gatesyp/ai-funding-daily**
 
-### Environment Variables on Vercel
+Pushes to `main` will trigger deployments on Vercel (once the GitHub integration is connected in the Vercel dashboard under Settings → Git).
 
-Make sure these are set in your Vercel project (Production + Preview):
+### Required Vercel Environment Variables
 
 - `DATABASE_URL`
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHANNEL_ID`
 - `INGEST_SECRET`
 
-You can add them via the Vercel dashboard or CLI:
+### Cron
 
-```bash
-vercel env add DATABASE_URL production
-vercel env add TELEGRAM_BOT_TOKEN production
-vercel env add TELEGRAM_CHANNEL_ID production
-vercel env add INGEST_SECRET production
-```
-
-### Cron Job
-
-Defined in `vercel.json`:
-
-```json
-{
-  "crons": [
-    {
-      "path": "/api/ingest",
-      "schedule": "0 14 * * *"
-    }
-  ]
-}
-```
-
-This runs every day at **14:00 UTC** (~8–9 AM Central Time).
+Runs every day at **14:00 UTC** via `vercel.json`.
 
 ---
 
 ## API Endpoints
 
-| Endpoint                        | Description                                      | Auth                  |
-|--------------------------------|--------------------------------------------------|-----------------------|
-| `POST /api/ingest`             | Full scrape + store + post new rounds            | `?secret=` or header  |
-| `GET /api/backfill?limit=30`   | Force post recent/historical rounds (enriched)   | `?secret=`            |
-| `GET /api/test-telegram`       | Send a test message to verify bot + channel      | `?secret=`            |
-| `GET /api/health`              | Basic health check                               | None                  |
-
-All protected endpoints accept the secret via query parameter or `x-ingest-secret` header.
+| Endpoint                        | Use Case                                      | Protected |
+|--------------------------------|-----------------------------------------------|---------|
+| `POST /api/ingest`             | Daily job (scrape + store + post)             | Yes     |
+| `GET /api/backfill?limit=XX`   | Force post N recent rounds with enrichment    | Yes     |
+| `GET /api/test-telegram`       | Verify bot can post                           | Yes     |
+| `GET /api/health`              | Health check                                  | No      |
 
 ---
 
 ## Important Notes
 
-- The system only posts **new** rounds it hasn't seen before (deduplication is based on company + round type + amount).
-- When enriching messages, it visits individual company pages to pull the one-sentence description and lead investors.
-- Some rounds legitimately have "Investors not disclosed" on aifunding.me.
-- The default test secret used during development was `test-secret-123` — **change this** for production.
+- Deduplication key = company + round type + amount
+- Enrichment (description + investors) happens on company pages when posting
+- Some rounds will say "Investors not disclosed" — this is expected
+- Change the default `INGEST_SECRET` before going to production
 
 ---
 
-Built following the original "AI Funding Daily — Production System Plan".
+The repository is public: https://github.com/gatesyp/ai-funding-daily
+
+Feel free to share it with your cofounder or other AI agents.
